@@ -78,7 +78,9 @@ const AZURE_RESPONSES_FIRST_EVENT_TIMEOUT_MS = 30_000;
 const MODEL_STREAM_COOPERATIVE_YIELD_INTERVAL_MS = 12;
 const MODEL_STREAM_COOPERATIVE_YIELD_MAX_EVENTS = 64;
 const RESPONSE_FAILED_NO_DETAILS_MESSAGE = "Unknown error (no error details in response)";
+const MAX_OPENAI_STRICT_TOOL_DOWNGRADE_DIAGNOSTIC_KEYS = 256;
 const log = createSubsystemLogger("openai-transport");
+const loggedOpenAIStrictToolDowngradeDiagnosticKeys = new Set<string>();
 
 type ReplayableResponseOutputMessage = Omit<ResponseOutputMessage, "id"> & { id?: string };
 type ReplayableResponseReasoningItem = Omit<ResponseReasoningItem, "id"> & { id?: string };
@@ -976,6 +978,9 @@ function resolveOpenAIStrictToolFlagWithDiagnostics(
   const strict = resolveOpenAIStrictToolFlagForInventory(tools, strictSetting);
   if (strictSetting === true && strict === false && log.isEnabled("debug", "any")) {
     const diagnostics = findOpenAIStrictToolSchemaDiagnostics(tools);
+    if (!shouldLogOpenAIStrictToolDowngradeDiagnostic(diagnostics, context)) {
+      return strict;
+    }
     const sample = diagnostics.slice(0, 5).map((entry) => ({
       tool: entry.toolName ?? `tool[${entry.toolIndex}]`,
       violations: entry.violations.slice(0, 8),
@@ -994,6 +999,44 @@ function resolveOpenAIStrictToolFlagWithDiagnostics(
     );
   }
   return strict;
+}
+
+function buildOpenAIStrictToolDowngradeDiagnosticKey(
+  diagnostics: ReturnType<typeof findOpenAIStrictToolSchemaDiagnostics>,
+  context: { transport: "responses" | "completions"; model: OpenAIModeModel },
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        transport: context.transport,
+        provider: context.model.provider ?? null,
+        model: context.model.id ?? null,
+        diagnostics: diagnostics.map((entry) => ({
+          toolIndex: entry.toolIndex,
+          toolName: entry.toolName ?? null,
+          violations: entry.violations,
+        })),
+      }),
+    )
+    .digest("hex");
+}
+
+function shouldLogOpenAIStrictToolDowngradeDiagnostic(
+  diagnostics: ReturnType<typeof findOpenAIStrictToolSchemaDiagnostics>,
+  context: { transport: "responses" | "completions"; model: OpenAIModeModel },
+): boolean {
+  const key = buildOpenAIStrictToolDowngradeDiagnosticKey(diagnostics, context);
+  if (loggedOpenAIStrictToolDowngradeDiagnosticKeys.has(key)) {
+    return false;
+  }
+  if (
+    loggedOpenAIStrictToolDowngradeDiagnosticKeys.size >=
+    MAX_OPENAI_STRICT_TOOL_DOWNGRADE_DIAGNOSTIC_KEYS
+  ) {
+    loggedOpenAIStrictToolDowngradeDiagnosticKeys.clear();
+  }
+  loggedOpenAIStrictToolDowngradeDiagnosticKeys.add(key);
+  return true;
 }
 
 function createResponsesFirstEventTimeoutError(model: Model<Api>, timeoutMs: number): Error {
@@ -2767,6 +2810,16 @@ function requiresGoogleCompatToolCallThoughtSignature(model: OpenAIModeModel): b
   return model.id.toLowerCase().includes("gemini-3");
 }
 
+const GOOGLE_COMPAT_THOUGHT_SIGNATURE_ELLIPSIS_RE = /[\u2026]|\.\.\./;
+const GOOGLE_COMPAT_THOUGHT_SIGNATURE_BASE64_RE = /^[A-Za-z0-9+/=]+$/;
+
+function hasGoogleCompatThoughtSignatureTruncationFootprint(value: string): boolean {
+  return (
+    GOOGLE_COMPAT_THOUGHT_SIGNATURE_ELLIPSIS_RE.test(value) ||
+    (GOOGLE_COMPAT_THOUGHT_SIGNATURE_BASE64_RE.test(value) && value.length % 4 !== 0)
+  );
+}
+
 function injectToolCallThoughtSignatures(
   outgoingMessages: unknown[],
   context: Context,
@@ -2818,8 +2871,14 @@ function injectToolCallThoughtSignatures(
       if (typeof id !== "string") {
         continue;
       }
-      const sig = sigById.get(id) ?? fallbackSig;
-      if (!sig) {
+      let sig: string | undefined = sigById.get(id) ?? fallbackSig;
+      if (typeof sig === "string" && sig.length > 0) {
+        const trimmed = sig.trim();
+        if (hasGoogleCompatThoughtSignatureTruncationFootprint(trimmed)) {
+          sig = fallbackSig;
+        }
+      }
+      if (typeof sig !== "string" || sig.length === 0) {
         continue;
       }
       const extra =
@@ -3144,7 +3203,7 @@ function mapStopReason(reason: string | null) {
   }
 }
 
-export const __testing = {
+export const testing = {
   assertCodeModeResponsesToolSurface,
   buildOpenAIClientHeaders,
   buildOpenAISdkClientOptions,
@@ -3165,3 +3224,4 @@ export const __testing = {
   summarizeResponsesTools,
   withResponsesFirstEventTimeout,
 };
+export { testing as __testing };
